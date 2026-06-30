@@ -100,6 +100,7 @@ def parse_pdf(pdf_url: str, group_filter: str = None):
 
     current_day = None
     current_time = None
+    seen = set()  # для устранения дублей: (day, timeStart, subject)
 
     for row in table:
         if not row:
@@ -108,10 +109,11 @@ def parse_pdf(pdf_url: str, group_filter: str = None):
         first_cell = str(row[0] or "").strip()
         second_cell = str(row[1] or "").strip() if len(row) > 1 else ""
 
-        for d in DAYS:
-            if first_cell == d or first_cell.startswith(d):
-                current_day = first_cell.split("\n")[0].strip()
-                break
+        # День определяем по ПЕРВОЙ строке текста в первой колонке
+        if first_cell:
+            first_line = first_cell.split("\n")[0].strip()
+            if first_line in DAYS:
+                current_day = first_line
 
         time_source = second_cell if second_cell else first_cell
         time_match = re.search(
@@ -127,45 +129,40 @@ def parse_pdf(pdf_url: str, group_filter: str = None):
         if not current_time:
             continue
 
-        # Проверяем: это строка с общим занятием на всех?
-        # Признак: ровно одна непустая ячейка среди всех колонок групп (2 и далее)
         non_empty_cells = [
             (i, str(row[i]).strip())
             for i in range(2, len(row))
             if row[i] and str(row[i]).strip()
         ]
 
-        if len(non_empty_cells) == 1:
-            # Это общее занятие — добавляем независимо от выбранной группы
-            cell_text = non_empty_cells[0][1]
+        def add_lesson(cell_text):
             parsed = parse_lesson_cell(cell_text)
-            if parsed:
-                lessons.append({
-                    "day": current_day,
-                    "timeStart": current_time[0],
-                    "timeEnd": current_time[1],
-                    **parsed
-                })
+            if not parsed:
+                return
+            key = (current_day, current_time[0], parsed["subject"])
+            if key in seen:
+                return
+            seen.add(key)
+            lessons.append({
+                "day": current_day,
+                "timeStart": current_time[0],
+                "timeEnd": current_time[1],
+                **parsed
+            })
+
+        if len(non_empty_cells) == 1:
+            add_lesson(non_empty_cells[0][1])
             continue
 
-        # Обычная строка — берём только нужные колонки
         for col in target_cols:
             if col >= len(row):
                 continue
             cell_text = row[col]
             if not cell_text or not str(cell_text).strip():
                 continue
+            add_lesson(str(cell_text))
 
-            parsed = parse_lesson_cell(str(cell_text))
-            if parsed:
-                lessons.append({
-                    "day": current_day,
-                    "timeStart": current_time[0],
-                    "timeEnd": current_time[1],
-                    **parsed
-                })
-
-    return lessons
+    return lessons                
 
 @app.get("/")
 def root():
