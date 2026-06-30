@@ -127,6 +127,28 @@ def parse_pdf(pdf_url: str, group_filter: str = None):
         if not current_time:
             continue
 
+        # Проверяем: это строка с общим занятием на всех?
+        # Признак: ровно одна непустая ячейка среди всех колонок групп (2 и далее)
+        non_empty_cells = [
+            (i, str(row[i]).strip())
+            for i in range(2, len(row))
+            if row[i] and str(row[i]).strip()
+        ]
+
+        if len(non_empty_cells) == 1:
+            # Это общее занятие — добавляем независимо от выбранной группы
+            cell_text = non_empty_cells[0][1]
+            parsed = parse_lesson_cell(cell_text)
+            if parsed:
+                lessons.append({
+                    "day": current_day,
+                    "timeStart": current_time[0],
+                    "timeEnd": current_time[1],
+                    **parsed
+                })
+            continue
+
+        # Обычная строка — берём только нужные колонки
         for col in target_cols:
             if col >= len(row):
                 continue
@@ -144,7 +166,6 @@ def parse_pdf(pdf_url: str, group_filter: str = None):
                 })
 
     return lessons
-
 
 @app.get("/")
 def root():
