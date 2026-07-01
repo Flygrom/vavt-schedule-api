@@ -15,7 +15,6 @@ app.add_middleware(
 )
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)"}
-
 DAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
 
@@ -30,12 +29,31 @@ def find_group_row_and_col(table, group_filter):
 def get_pdf_table(pdf_url: str):
     r = requests.get(pdf_url, headers=HEADERS, timeout=15)
     r.raise_for_status()
-
     with pdfplumber.open(io.BytesIO(r.content)) as pdf:
         for page in pdf.pages:
             tables = page.extract_tables()
             if tables:
                 return tables[0]
+    return None
+
+
+def extract_day(cell_text: str):
+    if not cell_text:
+        return None
+    first_line = cell_text.strip().split("\n")[0].strip()
+    if first_line in DAYS:
+        return first_line
+    return None
+
+
+def find_first_day_after(table, start_row: int):
+    """Ищет первый день недели начиная со строки start_row."""
+    for row in table[start_row:]:
+        if not row:
+            continue
+        day = extract_day(str(row[0] or ""))
+        if day:
+            return day
     return None
 
 
@@ -52,7 +70,7 @@ def parse_lesson_cell(text: str):
         text = text[:room_match.start()] + text[room_match.end():]
 
     type_match = re.search(
-        r"\(([слпрзктСЛПРЗКТ]{1,3}\.?|зачет|зачёт|экз\.?)\)",
+        r"\(([слпрзктСЛПРЗКТ]{1,3}\.?|зачет|зачёт|экз\.?|ПЗ|пз)\)",
         text, re.IGNORECASE
     )
     type_raw = type_match.group(1).lower().replace(".", "") if type_match else None
@@ -70,7 +88,6 @@ def parse_lesson_cell(text: str):
         text = text[:teacher_match.start()] + text[teacher_match.end():]
 
     subject = re.sub(r"\s+", " ", text).strip(" \n.,;:-_()")
-
     if not subject:
         subject = original.strip()
 
@@ -100,21 +117,21 @@ def parse_pdf(pdf_url: str, group_filter: str = None):
 
     current_day = None
     current_time = None
-    seen = set()  # для устранения дублей: (day, timeStart, subject)
+    seen = set()
 
-    for row in table:
+    for row_idx, row in enumerate(table):
         if not row:
             continue
 
         first_cell = str(row[0] or "").strip()
         second_cell = str(row[1] or "").strip() if len(row) > 1 else ""
 
-        # День определяем по ПЕРВОЙ строке текста в первой колонке
-        if first_cell:
-            first_line = first_cell.split("\n")[0].strip()
-            if first_line in DAYS:
-                current_day = first_line
+        # Обновляем день если есть в первой колонке
+        day = extract_day(first_cell)
+        if day:
+            current_day = day
 
+        # Время
         time_source = second_cell if second_cell else first_cell
         time_match = re.search(
             r"(\d{1,2}[.:]\d{2})\s*[-–—]\s*(\d{1,2}[.:]\d{2})",
@@ -129,6 +146,11 @@ def parse_pdf(pdf_url: str, group_filter: str = None):
         if not current_time:
             continue
 
+        # Если день ещё не определён — ищем первый следующий день в таблице
+        effective_day = current_day
+        if effective_day is None:
+            effective_day = find_first_day_after(table, row_idx)
+
         non_empty_cells = [
             (i, str(row[i]).strip())
             for i in range(2, len(row))
@@ -139,12 +161,12 @@ def parse_pdf(pdf_url: str, group_filter: str = None):
             parsed = parse_lesson_cell(cell_text)
             if not parsed:
                 return
-            key = (current_day, current_time[0], parsed["subject"])
+            key = (effective_day, current_time[0], parsed["subject"][:30])
             if key in seen:
                 return
             seen.add(key)
             lessons.append({
-                "day": current_day,
+                "day": effective_day,
                 "timeStart": current_time[0],
                 "timeEnd": current_time[1],
                 **parsed
@@ -162,7 +184,8 @@ def parse_pdf(pdf_url: str, group_filter: str = None):
                 continue
             add_lesson(str(cell_text))
 
-    return lessons                
+    return lessons
+
 
 @app.get("/")
 def root():
@@ -203,6 +226,20 @@ def get_groups(pdf_url: str):
         return {"ok": True, "groups": groups}
     except Exception as e:
         return {"ok": False, "error": str(e), "groups": []}
+
+
+@app.get("/debug-table")
+def debug_table(pdf_url: str):
+    try:
+        table = get_pdf_table(pdf_url)
+        if not table:
+            return {"ok": False, "error": "no table"}
+        rows = []
+        for i, row in enumerate(table[:10]):
+            rows.append({"row": i, "cells": [str(c)[:50] if c else None for c in row]})
+        return {"ok": True, "rows": rows}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 if __name__ == "__main__":
