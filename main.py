@@ -102,6 +102,23 @@ def parse_lesson_cell(text: str):
     return {"subject": subject, "teacher": teacher, "room": room, "type": lesson_type}
 
 
+def is_continuation_only(cell_text: str) -> bool:
+    """
+    True если ячейка содержит ТОЛЬКО препода и/или аудиторию,
+    без названия предмета — значит это rowspan-продолжение
+    пары из предыдущей строки в той же колонке.
+    """
+    stripped = cell_text.strip()
+    if not stripped:
+        return False
+    teacher_pattern = r"[А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.\s?[А-ЯЁ]\."
+    room_pattern = r"[Аа]уд\.?\s*[\d\.]+[а-яА-Яa-zA-Z]?"
+    test = re.sub(teacher_pattern, "", stripped)
+    test = re.sub(room_pattern, "", test)
+    test = test.strip(" \n.,;:-_")
+    return len(test) < 3 and len(stripped) > 0
+
+
 def parse_pdf(pdf_url: str, group_filter: str = None):
     table = get_pdf_table(pdf_url)
     if not table:
@@ -153,7 +170,20 @@ def parse_pdf(pdf_url: str, group_filter: str = None):
             if row[i] and str(row[i]).strip()
         ]
 
-        def add_lesson(cell_text):
+        def add_lesson(cell_text, col_index=None):
+            if col_index is not None and is_continuation_only(cell_text):
+                for prev in reversed(lessons):
+                    if prev.get("_col") == col_index and prev["day"] == effective_day:
+                        parsed_extra = parse_lesson_cell(cell_text)
+                        if parsed_extra:
+                            if parsed_extra.get("teacher") and not prev.get("teacher"):
+                                prev["teacher"] = parsed_extra["teacher"]
+                            if parsed_extra.get("room") and not prev.get("room"):
+                                prev["room"] = parsed_extra["room"]
+                            prev["timeEnd"] = current_time[1]
+                        return
+                return
+
             parsed = parse_lesson_cell(cell_text)
             if not parsed:
                 return
@@ -165,11 +195,12 @@ def parse_pdf(pdf_url: str, group_filter: str = None):
                 "day": effective_day,
                 "timeStart": current_time[0],
                 "timeEnd": current_time[1],
+                "_col": col_index,
                 **parsed
             })
 
         if len(group_cells) == 1 and group_cells[0][0] == first_group_col:
-            add_lesson(group_cells[0][1])
+            add_lesson(group_cells[0][1], first_group_col)
             continue
 
         for col in target_cols:
@@ -178,7 +209,10 @@ def parse_pdf(pdf_url: str, group_filter: str = None):
             cell_text = row[col]
             if not cell_text or not str(cell_text).strip():
                 continue
-            add_lesson(str(cell_text))
+            add_lesson(str(cell_text), col)
+
+    for lesson in lessons:
+        lesson.pop("_col", None)
 
     return lessons
 
