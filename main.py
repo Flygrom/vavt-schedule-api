@@ -76,18 +76,12 @@ def parse_lesson_cell(text: str):
 
     original = text
 
-    # Аудитория
     room_match = re.search(r"[Аа]уд\.?\s*([\d\.]+[а-яА-Яa-zA-Z]?)", text)
     room = room_match.group(1) if room_match else None
     if room_match:
         text = text[:room_match.start()] + text[room_match.end():]
 
-    # Тип пары — ищем ПОСЛЕДНЮЮ скобочную группу, содержимое которой ТОЧНО
-    # совпадает целиком с известным типом (не частично внутри произвольного слова)
-    type_pattern = re.compile(
-        r"\((с|л|пр|пз|з|зач|зачет|зачёт|экз|ПЗ)\.?\)",
-        re.IGNORECASE
-    )
+    type_pattern = re.compile(r"\((с|л|пр|пз|з|зач|зачет|зачёт|экз|С|Л|ПР|ПЗ|З|ЗАЧ|ЗАЧЕТ|ЗАЧЁТ|ЭКЗ)\.?\)")
     matches = list(type_pattern.finditer(text))
     lesson_type = None
     if matches:
@@ -96,13 +90,12 @@ def parse_lesson_cell(text: str):
         lesson_type = TYPE_MAP.get(type_raw, type_raw.upper())
         text = text[:last_match.start()] + text[last_match.end():]
 
-    # Преподаватель
     teacher_match = re.search(r"[А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.\s?[А-ЯЁ]\.", text)
     teacher = teacher_match.group(0).strip() if teacher_match else None
     if teacher_match:
         text = text[:teacher_match.start()] + text[teacher_match.end():]
 
-    subject = re.sub(r"\s+", " ", text).strip(" \n.,;:-_()")
+    subject = re.sub(r"\s+", " ", text).strip(" \n.,;:-_")
     if not subject:
         subject = original.strip()
 
@@ -142,10 +135,7 @@ def parse_pdf(pdf_url: str, group_filter: str = None):
             current_day = day
 
         time_source = second_cell if second_cell else first_cell
-        time_match = re.search(
-            r"(\d{1,2}[.:]\d{2})\s*[-–—]\s*(\d{1,2}[.:]\d{2})",
-            time_source
-        )
+        time_match = re.search(r"(\d{1,2}[.:]\d{2})\s*[-–—]\s*(\d{1,2}[.:]\d{2})", time_source)
         if time_match:
             current_time = (
                 time_match.group(1).replace(".", ":"),
@@ -242,7 +232,8 @@ def debug_table(pdf_url: str):
 
 @app.get("/debug-parse")
 def debug_parse(text: str):
-    return parse_lesson_cell(text)
+    result = parse_lesson_cell(text)
+    return {"input": text, "result": result}
 
 
 if __name__ == "__main__":
