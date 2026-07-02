@@ -18,12 +18,12 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)
 DAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
 
-def find_group_row_and_col(table, group_filter):
-    for row_idx, row in enumerate(table):
+def find_group_col(table, group_filter):
+    for row in table:
         for col_idx, cell in enumerate(row):
             if cell and group_filter == str(cell).strip():
-                return row_idx, col_idx
-    return None, None
+                return col_idx
+    return None
 
 
 def get_pdf_table(pdf_url: str):
@@ -40,14 +40,11 @@ def get_pdf_table(pdf_url: str):
 def extract_day(cell_text: str):
     if not cell_text:
         return None
-    first_line = cell_text.strip().split("\n")[0].strip()
-    if first_line in DAYS:
-        return first_line
-    return None
+    first_line = str(cell_text).strip().split("\n")[0].strip()
+    return first_line if first_line in DAYS else None
 
 
 def find_first_day_after(table, start_row: int):
-    """Ищет первый день недели начиная со строки start_row."""
     for row in table[start_row:]:
         if not row:
             continue
@@ -57,6 +54,16 @@ def find_first_day_after(table, start_row: int):
     return None
 
 
+def find_first_group_col(table):
+    """Возвращает индекс первой колонки с группами (где паттерн Б24М-...)"""
+    pattern = re.compile(r"[А-ЯЁ]\d{2}[А-ЯЁ][–\-—][А-ЯЁ]{2,6}\.\d")
+    for row in table:
+        for col_idx, cell in enumerate(row):
+            if cell and pattern.match(str(cell).strip()):
+                return col_idx
+    return 2  # дефолт
+
+
 def parse_lesson_cell(text: str):
     text = (text or "").strip()
     if not text or len(text) < 3:
@@ -64,11 +71,13 @@ def parse_lesson_cell(text: str):
 
     original = text
 
+    # Аудитория
     room_match = re.search(r"[Аа]уд\.?\s*([\d\.]+[а-яА-Яa-zA-Z]?)", text)
     room = room_match.group(1) if room_match else None
     if room_match:
         text = text[:room_match.start()] + text[room_match.end():]
 
+    # Тип пары
     type_match = re.search(
         r"\(([слпрзктСЛПРЗКТ]{1,3}\.?|зачет|зачёт|экз\.?|ПЗ|пз)\)",
         text, re.IGNORECASE
@@ -82,6 +91,7 @@ def parse_lesson_cell(text: str):
     if type_match:
         text = text[:type_match.start()] + text[type_match.end():]
 
+    # Преподаватель
     teacher_match = re.search(r"[А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.\s?[А-ЯЁ]\.", text)
     teacher = teacher_match.group(0).strip() if teacher_match else None
     if teacher_match:
@@ -91,12 +101,7 @@ def parse_lesson_cell(text: str):
     if not subject:
         subject = original.strip()
 
-    return {
-        "subject": subject,
-        "teacher": teacher,
-        "room": room,
-        "type": lesson_type
-    }
+    return {"subject": subject, "teacher": teacher, "room": room, "type": lesson_type}
 
 
 def parse_pdf(pdf_url: str, group_filter: str = None):
@@ -105,15 +110,16 @@ def parse_pdf(pdf_url: str, group_filter: str = None):
         return []
 
     lessons = []
+    first_group_col = find_first_group_col(table)
 
     if group_filter:
-        _, group_col = find_group_row_and_col(table, group_filter)
+        group_col = find_group_col(table, group_filter)
         if group_col is None:
             return []
         target_cols = [group_col]
     else:
         max_cols = max(len(row) for row in table)
-        target_cols = list(range(2, max_cols))
+        target_cols = list(range(first_group_col, max_cols))
 
     current_day = None
     current_time = None
@@ -126,12 +132,10 @@ def parse_pdf(pdf_url: str, group_filter: str = None):
         first_cell = str(row[0] or "").strip()
         second_cell = str(row[1] or "").strip() if len(row) > 1 else ""
 
-        # Обновляем день если есть в первой колонке
         day = extract_day(first_cell)
         if day:
             current_day = day
 
-        # Время
         time_source = second_cell if second_cell else first_cell
         time_match = re.search(
             r"(\d{1,2}[.:]\d{2})\s*[-–—]\s*(\d{1,2}[.:]\d{2})",
@@ -146,14 +150,12 @@ def parse_pdf(pdf_url: str, group_filter: str = None):
         if not current_time:
             continue
 
-        # Если день ещё не определён — ищем первый следующий день в таблице
-        effective_day = current_day
-        if effective_day is None:
-            effective_day = find_first_day_after(table, row_idx)
+        effective_day = current_day or find_first_day_after(table, row_idx)
 
-        non_empty_cells = [
+        # Ячейки начиная с первой колонки групп
+        group_cells = [
             (i, str(row[i]).strip())
-            for i in range(2, len(row))
+            for i in range(first_group_col, len(row))
             if row[i] and str(row[i]).strip()
         ]
 
@@ -172,10 +174,12 @@ def parse_pdf(pdf_url: str, group_filter: str = None):
                 **parsed
             })
 
-        if len(non_empty_cells) == 1:
-            add_lesson(non_empty_cells[0][1])
+        # Общее занятие = ровно одна непустая ячейка И она в первой колонке групп (col == first_group_col)
+        if len(group_cells) == 1 and group_cells[0][0] == first_group_col:
+            add_lesson(group_cells[0][1])
             continue
 
+        # Иначе берём только нужные колонки
         for col in target_cols:
             if col >= len(row):
                 continue
@@ -196,12 +200,7 @@ def root():
 def get_schedule(pdf_url: str, group: str = None):
     try:
         lessons = parse_pdf(pdf_url, group)
-        return {
-            "ok": True,
-            "group": group,
-            "count": len(lessons),
-            "lessons": lessons
-        }
+        return {"ok": True, "group": group, "count": len(lessons), "lessons": lessons}
     except Exception as e:
         return {"ok": False, "error": str(e), "lessons": []}
 
@@ -212,17 +211,14 @@ def get_groups(pdf_url: str):
         table = get_pdf_table(pdf_url)
         if not table:
             return {"ok": True, "groups": []}
-
         groups = []
         pattern = re.compile(r"^[А-ЯЁ]\d{2}[А-ЯЁ][–\-—][А-ЯЁ]{2,6}\.\d$")
-
         for row in table:
             for cell in row:
                 if cell and pattern.match(str(cell).strip()):
                     name = str(cell).strip()
                     if name not in groups:
                         groups.append(name)
-
         return {"ok": True, "groups": groups}
     except Exception as e:
         return {"ok": False, "error": str(e), "groups": []}
@@ -235,8 +231,8 @@ def debug_table(pdf_url: str):
         if not table:
             return {"ok": False, "error": "no table"}
         rows = []
-        for i, row in enumerate(table[:10]):
-            rows.append({"row": i, "cells": [str(c)[:50] if c else None for c in row]})
+        for i, row in enumerate(table[:15]):
+            rows.append({"row": i, "cells": [str(c)[:60] if c else None for c in row]})
         return {"ok": True, "rows": rows}
     except Exception as e:
         return {"ok": False, "error": str(e)}
