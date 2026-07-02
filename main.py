@@ -17,6 +17,12 @@ app.add_middleware(
 HEADERS = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)"}
 DAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
+TYPE_MAP = {
+    "с": "Семинар", "л": "Лекция", "пр": "Практика", "пз": "Практика",
+    "з": "Зачёт", "зач": "Зачёт", "зачет": "Зачёт", "зачёт": "Зачёт",
+    "экз": "Экзамен"
+}
+
 
 def find_group_col(table, group_filter):
     for row in table:
@@ -55,13 +61,12 @@ def find_first_day_after(table, start_row: int):
 
 
 def find_first_group_col(table):
-    """Возвращает индекс первой колонки с группами (где паттерн Б24М-...)"""
     pattern = re.compile(r"[А-ЯЁ]\d{2}[А-ЯЁ][–\-—][А-ЯЁ]{2,6}\.\d")
     for row in table:
         for col_idx, cell in enumerate(row):
             if cell and pattern.match(str(cell).strip()):
                 return col_idx
-    return 2  # дефолт
+    return 2
 
 
 def parse_lesson_cell(text: str):
@@ -77,19 +82,19 @@ def parse_lesson_cell(text: str):
     if room_match:
         text = text[:room_match.start()] + text[room_match.end():]
 
-    # Тип пары
-    type_match = re.search(
-        r"\(([слпрзктСЛПРЗКТ]{1,3}\.?|зачет|зачёт|экз\.?|ПЗ|пз)\)",
-        text, re.IGNORECASE
+    # Тип пары — ищем ПОСЛЕДНЮЮ скобочную группу, содержимое которой ТОЧНО
+    # совпадает целиком с известным типом (не частично внутри произвольного слова)
+    type_pattern = re.compile(
+        r"\((с|л|пр|пз|з|зач|зачет|зачёт|экз|ПЗ)\.?\)",
+        re.IGNORECASE
     )
-    type_raw = type_match.group(1).lower().replace(".", "") if type_match else None
-    lesson_type = {
-        "с": "Семинар", "л": "Лекция", "пр": "Практика", "пз": "Практика",
-        "з": "Зачёт", "зач": "Зачёт", "зачет": "Зачёт", "зачёт": "Зачёт",
-        "экз": "Экзамен"
-    }.get(type_raw, type_raw.upper() if type_raw else None)
-    if type_match:
-        text = text[:type_match.start()] + text[type_match.end():]
+    matches = list(type_pattern.finditer(text))
+    lesson_type = None
+    if matches:
+        last_match = matches[-1]
+        type_raw = last_match.group(1).lower().replace(".", "")
+        lesson_type = TYPE_MAP.get(type_raw, type_raw.upper())
+        text = text[:last_match.start()] + text[last_match.end():]
 
     # Преподаватель
     teacher_match = re.search(r"[А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.\s?[А-ЯЁ]\.", text)
@@ -152,7 +157,6 @@ def parse_pdf(pdf_url: str, group_filter: str = None):
 
         effective_day = current_day or find_first_day_after(table, row_idx)
 
-        # Ячейки начиная с первой колонки групп
         group_cells = [
             (i, str(row[i]).strip())
             for i in range(first_group_col, len(row))
@@ -174,12 +178,10 @@ def parse_pdf(pdf_url: str, group_filter: str = None):
                 **parsed
             })
 
-        # Общее занятие = ровно одна непустая ячейка И она в первой колонке групп (col == first_group_col)
         if len(group_cells) == 1 and group_cells[0][0] == first_group_col:
             add_lesson(group_cells[0][1])
             continue
 
-        # Иначе берём только нужные колонки
         for col in target_cols:
             if col >= len(row):
                 continue
@@ -236,6 +238,11 @@ def debug_table(pdf_url: str):
         return {"ok": True, "rows": rows}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+@app.get("/debug-parse")
+def debug_parse(text: str):
+    return parse_lesson_cell(text)
 
 
 if __name__ == "__main__":
