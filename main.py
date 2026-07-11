@@ -2,8 +2,43 @@ import io
 import re
 import requests
 import pdfplumber
+from datetime import datetime
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean
+from sqlalchemy.orm import sessionmaker, declarative_base
+
+# MARK: - База данных
+
+DATABASE_URL = "sqlite:///./homework.db"
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+
+class Homework(Base):
+    __tablename__ = "homework"
+
+    id = Column(Integer, primary_key=True, index=True)
+    group_name = Column(String, index=True)
+    subject = Column(String)
+    author_name = Column(String)
+    text = Column(String)
+    is_shared = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+Base.metadata.create_all(bind=engine)
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
 
 app = FastAPI()
 
@@ -23,6 +58,8 @@ TYPE_MAP = {
     "экз": "Экзамен"
 }
 
+
+# MARK: - PDF-парсинг (без изменений)
 
 def find_group_col(table, group_filter):
     for row in table:
@@ -103,11 +140,6 @@ def parse_lesson_cell(text: str):
 
 
 def is_continuation_only(cell_text: str) -> bool:
-    """
-    True если ячейка содержит ТОЛЬКО препода и/или аудиторию,
-    без названия предмета — значит это rowspan-продолжение
-    пары из предыдущей строки в той же колонке.
-    """
     stripped = cell_text.strip()
     if not stripped:
         return False
@@ -250,24 +282,104 @@ def get_groups(pdf_url: str):
         return {"ok": False, "error": str(e), "groups": []}
 
 
-@app.get("/debug-table")
-def debug_table(pdf_url: str):
+# MARK: - Домашние задания
+
+class HomeworkCreate(BaseModel):
+    group_name: str
+    subject: str
+    author_name: str
+    text: str
+    is_shared: bool = True
+
+
+@app.post("/homework")
+def create_homework(hw: HomeworkCreate):
+    from sqlalchemy.orm import Session
+    db: Session = SessionLocal()
     try:
-        table = get_pdf_table(pdf_url)
-        if not table:
-            return {"ok": False, "error": "no table"}
-        rows = []
-        for i, row in enumerate(table[:15]):
-            rows.append({"row": i, "cells": [str(c)[:60] if c else None for c in row]})
-        return {"ok": True, "rows": rows}
+        entry = Homework(
+            group_name=hw.group_name,
+            subject=hw.subject,
+            author_name=hw.author_name,
+            text=hw.text,
+            is_shared=hw.is_shared,
+        )
+        db.add(entry)
+        db.commit()
+        db.refresh(entry)
+        return {
+            "ok": True,
+            "id": entry.id,
+            "group_name": entry.group_name,
+            "subject": entry.subject,
+            "author_name": entry.author_name,
+            "text": entry.text,
+            "is_shared": entry.is_shared,
+            "created_at": entry.created_at.isoformat(),
+        }
     except Exception as e:
         return {"ok": False, "error": str(e)}
+    finally:
+        db.close()
 
 
-@app.get("/debug-parse")
-def debug_parse(text: str):
-    result = parse_lesson_cell(text)
-    return {"input": text, "result": result}
+@app.get("/homework")
+def list_homework(group_name: str, author_name: str = None):
+    """
+    Возвращает все ОБЩИЕ ДЗ для группы + ЛИЧНЫЕ ДЗ этого автора (если указан).
+    """
+    from sqlalchemy.orm import Session
+    db: Session = SessionLocal()
+    try:
+        query = db.query(Homework).filter(Homework.group_name == group_name)
+
+        if author_name:
+            # Общие для всех ИЛИ личные этого автора
+            entries = query.filter(
+                (Homework.is_shared == True) | (Homework.author_name == author_name)
+            ).order_by(Homework.created_at.desc()).all()
+        else:
+            entries = query.filter(Homework.is_shared == True).order_by(Homework.created_at.desc()).all()
+
+        return {
+            "ok": True,
+            "items": [
+                {
+                    "id": e.id,
+                    "group_name": e.group_name,
+                    "subject": e.subject,
+                    "author_name": e.author_name,
+                    "text": e.text,
+                    "is_shared": e.is_shared,
+                    "created_at": e.created_at.isoformat(),
+                }
+                for e in entries
+            ]
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e), "items": []}
+    finally:
+        db.close()
+
+
+@app.delete("/homework/{homework_id}")
+def delete_homework(homework_id: int, author_name: str):
+    """Удалить можно только своё ДЗ (проверка по author_name)."""
+    from sqlalchemy.orm import Session
+    db: Session = SessionLocal()
+    try:
+        entry = db.query(Homework).filter(Homework.id == homework_id).first()
+        if not entry:
+            return {"ok": False, "error": "Не найдено"}
+        if entry.author_name != author_name:
+            return {"ok": False, "error": "Можно удалять только своё ДЗ"}
+        db.delete(entry)
+        db.commit()
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    finally:
+        db.close()
 
 
 if __name__ == "__main__":
