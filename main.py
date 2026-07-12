@@ -2,12 +2,22 @@ import io
 import re
 import requests
 import pdfplumber
+import cloudinary
+import cloudinary.uploader
 from datetime import datetime
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean
-from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, ForeignKey
+from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
+
+# MARK: - Cloudinary
+
+cloudinary.config(
+    cloud_name="bfolh7o5",
+    api_key="519197542141111",
+    api_secret="-C76Y2uFwF4xkI5E0282rkuAjOg"
+)
 
 # MARK: - База данных
 
@@ -27,6 +37,20 @@ class Homework(Base):
     text = Column(String)
     is_shared = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+    files = relationship("HomeworkFile", back_populates="homework", cascade="all, delete-orphan")
+
+
+class HomeworkFile(Base):
+    __tablename__ = "homework_files"
+
+    id = Column(Integer, primary_key=True, index=True)
+    homework_id = Column(Integer, ForeignKey("homework.id"))
+    file_url = Column(String)
+    file_type = Column(String)  # "image" или "document"
+    file_name = Column(String)
+
+    homework = relationship("Homework", back_populates="files")
 
 
 Base.metadata.create_all(bind=engine)
@@ -292,9 +316,29 @@ class HomeworkCreate(BaseModel):
     is_shared: bool = True
 
 
+def homework_to_dict(entry: Homework):
+    return {
+        "id": entry.id,
+        "group_name": entry.group_name,
+        "subject": entry.subject,
+        "author_name": entry.author_name,
+        "text": entry.text,
+        "is_shared": entry.is_shared,
+        "created_at": entry.created_at.isoformat(),
+        "files": [
+            {
+                "id": f.id,
+                "file_url": f.file_url,
+                "file_type": f.file_type,
+                "file_name": f.file_name,
+            }
+            for f in entry.files
+        ]
+    }
+
+
 @app.post("/homework")
 def create_homework(hw: HomeworkCreate):
-    from sqlalchemy.orm import Session
     db: Session = SessionLocal()
     try:
         entry = Homework(
@@ -307,16 +351,7 @@ def create_homework(hw: HomeworkCreate):
         db.add(entry)
         db.commit()
         db.refresh(entry)
-        return {
-            "ok": True,
-            "id": entry.id,
-            "group_name": entry.group_name,
-            "subject": entry.subject,
-            "author_name": entry.author_name,
-            "text": entry.text,
-            "is_shared": entry.is_shared,
-            "created_at": entry.created_at.isoformat(),
-        }
+        return {"ok": True, **homework_to_dict(entry)}
     except Exception as e:
         return {"ok": False, "error": str(e)}
     finally:
@@ -325,37 +360,18 @@ def create_homework(hw: HomeworkCreate):
 
 @app.get("/homework")
 def list_homework(group_name: str, author_name: str = None):
-    """
-    Возвращает все ОБЩИЕ ДЗ для группы + ЛИЧНЫЕ ДЗ этого автора (если указан).
-    """
-    from sqlalchemy.orm import Session
     db: Session = SessionLocal()
     try:
         query = db.query(Homework).filter(Homework.group_name == group_name)
 
         if author_name:
-            # Общие для всех ИЛИ личные этого автора
             entries = query.filter(
                 (Homework.is_shared == True) | (Homework.author_name == author_name)
             ).order_by(Homework.created_at.desc()).all()
         else:
             entries = query.filter(Homework.is_shared == True).order_by(Homework.created_at.desc()).all()
 
-        return {
-            "ok": True,
-            "items": [
-                {
-                    "id": e.id,
-                    "group_name": e.group_name,
-                    "subject": e.subject,
-                    "author_name": e.author_name,
-                    "text": e.text,
-                    "is_shared": e.is_shared,
-                    "created_at": e.created_at.isoformat(),
-                }
-                for e in entries
-            ]
-        }
+        return {"ok": True, "items": [homework_to_dict(e) for e in entries]}
     except Exception as e:
         return {"ok": False, "error": str(e), "items": []}
     finally:
@@ -364,8 +380,6 @@ def list_homework(group_name: str, author_name: str = None):
 
 @app.delete("/homework/{homework_id}")
 def delete_homework(homework_id: int, author_name: str):
-    """Удалить можно только своё ДЗ (проверка по author_name)."""
-    from sqlalchemy.orm import Session
     db: Session = SessionLocal()
     try:
         entry = db.query(Homework).filter(Homework.id == homework_id).first()
@@ -376,6 +390,49 @@ def delete_homework(homework_id: int, author_name: str):
         db.delete(entry)
         db.commit()
         return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    finally:
+        db.close()
+
+
+# MARK: - Загрузка файлов к ДЗ
+
+@app.post("/homework/{homework_id}/files")
+async def upload_homework_file(homework_id: int, file: UploadFile = File(...)):
+    db: Session = SessionLocal()
+    try:
+        entry = db.query(Homework).filter(Homework.id == homework_id).first()
+        if not entry:
+            return {"ok": False, "error": "Домашнее задание не найдено"}
+
+        content = await file.read()
+        content_type = file.content_type or ""
+        is_image = content_type.startswith("image/")
+
+        upload_result = cloudinary.uploader.upload(
+            content,
+            resource_type="image" if is_image else "raw",
+            folder="vavt_homework",
+        )
+
+        file_entry = HomeworkFile(
+            homework_id=homework_id,
+            file_url=upload_result["secure_url"],
+            file_type="image" if is_image else "document",
+            file_name=file.filename or "file",
+        )
+        db.add(file_entry)
+        db.commit()
+        db.refresh(file_entry)
+
+        return {
+            "ok": True,
+            "id": file_entry.id,
+            "file_url": file_entry.file_url,
+            "file_type": file_entry.file_type,
+            "file_name": file_entry.file_name,
+        }
     except Exception as e:
         return {"ok": False, "error": str(e)}
     finally:
