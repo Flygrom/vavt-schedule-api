@@ -4,8 +4,10 @@ import requests
 import pdfplumber
 import cloudinary
 import cloudinary.uploader
+from bs4 import BeautifulSoup
 from datetime import datetime
-from fastapi import FastAPI, UploadFile, File, Form
+from urllib.parse import quote
+from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, ForeignKey
@@ -47,22 +49,29 @@ class HomeworkFile(Base):
     id = Column(Integer, primary_key=True, index=True)
     homework_id = Column(Integer, ForeignKey("homework.id"))
     file_url = Column(String)
-    file_type = Column(String)  # "image" или "document"
+    file_type = Column(String)
     file_name = Column(String)
 
     homework = relationship("Homework", back_populates="files")
 
 
+class TeacherLesson(Base):
+    __tablename__ = "teacher_lessons"
+
+    id = Column(Integer, primary_key=True, index=True)
+    faculty = Column(String, index=True)
+    teacher_name = Column(String, index=True)
+    day = Column(String)
+    time_start = Column(String)
+    time_end = Column(String)
+    subject = Column(String)
+    room = Column(String)
+    group_name = Column(String)
+    week_label = Column(String)
+    indexed_at = Column(DateTime, default=datetime.utcnow)
+
+
 Base.metadata.create_all(bind=engine)
-
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
 
 app = FastAPI()
 
@@ -83,7 +92,7 @@ TYPE_MAP = {
 }
 
 
-# MARK: - PDF-парсинг (без изменений)
+# MARK: - PDF-парсинг (базовые функции)
 
 def find_group_col(table, group_filter):
     for row in table:
@@ -326,12 +335,7 @@ def homework_to_dict(entry: Homework):
         "is_shared": entry.is_shared,
         "created_at": entry.created_at.isoformat(),
         "files": [
-            {
-                "id": f.id,
-                "file_url": f.file_url,
-                "file_type": f.file_type,
-                "file_name": f.file_name,
-            }
+            {"id": f.id, "file_url": f.file_url, "file_type": f.file_type, "file_name": f.file_name}
             for f in entry.files
         ]
     }
@@ -363,14 +367,12 @@ def list_homework(group_name: str, author_name: str = None):
     db: Session = SessionLocal()
     try:
         query = db.query(Homework).filter(Homework.group_name == group_name)
-
         if author_name:
             entries = query.filter(
                 (Homework.is_shared == True) | (Homework.author_name == author_name)
             ).order_by(Homework.created_at.desc()).all()
         else:
             entries = query.filter(Homework.is_shared == True).order_by(Homework.created_at.desc()).all()
-
         return {"ok": True, "items": [homework_to_dict(e) for e in entries]}
     except Exception as e:
         return {"ok": False, "error": str(e), "items": []}
@@ -395,8 +397,6 @@ def delete_homework(homework_id: int, author_name: str):
     finally:
         db.close()
 
-
-# MARK: - Загрузка файлов к ДЗ
 
 @app.post("/homework/{homework_id}/files")
 async def upload_homework_file(homework_id: int, file: UploadFile = File(...)):
@@ -427,14 +427,172 @@ async def upload_homework_file(homework_id: int, file: UploadFile = File(...)):
         db.refresh(file_entry)
 
         return {
-            "ok": True,
-            "id": file_entry.id,
-            "file_url": file_entry.file_url,
-            "file_type": file_entry.file_type,
-            "file_name": file_entry.file_name,
+            "ok": True, "id": file_entry.id, "file_url": file_entry.file_url,
+            "file_type": file_entry.file_type, "file_name": file_entry.file_name,
         }
     except Exception as e:
         return {"ok": False, "error": str(e)}
+    finally:
+        db.close()
+
+
+# MARK: - Обход сайта для индексации преподавателей
+
+def fetch_html(url: str) -> str:
+    r = requests.get(url, headers=HEADERS, timeout=15)
+    r.raise_for_status()
+    return r.text
+
+
+def parse_tile_links(html: str):
+    soup = BeautifulSoup(html, "html.parser")
+    links = []
+    for a in soup.select("a.link-item-a"):
+        href = a.get("href", "")
+        span = a.select_one("span")
+        title = span.text.strip() if span else ""
+        if href and title:
+            links.append({"href": href, "title": title})
+    return links
+
+
+def is_schedule_page(html: str) -> bool:
+    soup = BeautifulSoup(html, "html.parser")
+    return soup.select_one("#_list_sched") is not None
+
+
+def parse_schedule_page_pdfs(html: str):
+    """Возвращает список (pdf_url, week_label) для страницы расписания."""
+    soup = BeautifulSoup(html, "html.parser")
+    results = []
+    for item in soup.select("#_list_sched ._items_"):
+        title_el = item.select_one("h2.title-box")
+        week_label = title_el.text.strip() if title_el else ""
+        for a in item.select(".rasp-list a"):
+            href = a.get("href", "")
+            if href:
+                full_url = href if href.startswith("http") else "https://www.vavt.ru" + href
+                results.append((full_url, week_label))
+    return results
+
+
+def index_faculty_teachers(faculty_tile_href: str, faculty_name: str, max_weeks_per_group: int = 3):
+    """
+    Обходит все курсы одного факультета, для каждого — берёт несколько
+    ближайших недель, парсит ВСЕ группы в каждом PDF и собирает
+    список пар каждого преподавателя.
+    """
+    full_url = faculty_tile_href if faculty_tile_href.startswith("http") else "https://www.vavt.ru" + faculty_tile_href
+    html = fetch_html(full_url)
+
+    if not is_schedule_page(html):
+        # Это ещё уровень курсов — заходим в каждый курс
+        course_tiles = parse_tile_links(html)
+        all_results = []
+        for tile in course_tiles:
+            all_results += index_faculty_teachers(tile["href"], faculty_name, max_weeks_per_group)
+        return all_results
+
+    pdf_list = parse_schedule_page_pdfs(html)
+    pdf_list = pdf_list[:max_weeks_per_group]
+
+    results = []
+    for pdf_url, week_label in pdf_list:
+        try:
+            table = get_pdf_table(pdf_url)
+            if not table:
+                continue
+
+            lessons = parse_pdf(pdf_url, group_filter=None)
+
+            # Также нужно знать К КАКОЙ группе относится каждая пара —
+            # parse_pdf без фильтра смешивает все колонки. Для индексации
+            # преподавателей нам нужна привязка к группе, поэтому парсим
+            # каждую группу отдельно.
+            pattern = re.compile(r"^[А-ЯЁ]\d{2}[А-ЯЁ][–\-—][А-ЯЁ]{2,6}\.\d$")
+            groups = []
+            for row in table:
+                for cell in row:
+                    if cell and pattern.match(str(cell).strip()):
+                        name = str(cell).strip()
+                        if name not in groups:
+                            groups.append(name)
+
+            for group_name in groups:
+                group_lessons = parse_pdf(pdf_url, group_filter=group_name)
+                for lesson in group_lessons:
+                    if lesson.get("teacher"):
+                        results.append({
+                            "faculty": faculty_name,
+                            "teacher_name": lesson["teacher"],
+                            "day": lesson.get("day"),
+                            "time_start": lesson.get("timeStart"),
+                            "time_end": lesson.get("timeEnd"),
+                            "subject": lesson.get("subject"),
+                            "room": lesson.get("room"),
+                            "group_name": group_name,
+                            "week_label": week_label,
+                        })
+        except Exception:
+            continue
+
+    return results
+
+
+@app.post("/index-faculty")
+def trigger_faculty_index(faculty_href: str, faculty_name: str):
+    """
+    Запускает полную индексацию преподавателей одного факультета.
+    faculty_href — href плитки факультета (например из /schedule/?f=...&o=...&n=ФВМ)
+    """
+    try:
+        results = index_faculty_teachers(faculty_href, faculty_name)
+
+        db: Session = SessionLocal()
+        try:
+            # Удаляем старый индекс этого факультета перед вставкой нового
+            db.query(TeacherLesson).filter(TeacherLesson.faculty == faculty_name).delete()
+
+            for r in results:
+                entry = TeacherLesson(**r)
+                db.add(entry)
+            db.commit()
+        finally:
+            db.close()
+
+        return {"ok": True, "indexed_count": len(results)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/teachers/search")
+def search_teachers(query: str, faculty: str = None):
+    db: Session = SessionLocal()
+    try:
+        q = db.query(TeacherLesson).filter(TeacherLesson.teacher_name.ilike(f"%{query}%"))
+        if faculty:
+            q = q.filter(TeacherLesson.faculty == faculty)
+
+        entries = q.order_by(TeacherLesson.day, TeacherLesson.time_start).all()
+
+        return {
+            "ok": True,
+            "items": [
+                {
+                    "teacher_name": e.teacher_name,
+                    "day": e.day,
+                    "time_start": e.time_start,
+                    "time_end": e.time_end,
+                    "subject": e.subject,
+                    "room": e.room,
+                    "group_name": e.group_name,
+                    "week_label": e.week_label,
+                }
+                for e in entries
+            ]
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e), "items": []}
     finally:
         db.close()
 
