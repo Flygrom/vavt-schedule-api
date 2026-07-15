@@ -6,7 +6,6 @@ import cloudinary
 import cloudinary.uploader
 from bs4 import BeautifulSoup
 from datetime import datetime
-from urllib.parse import quote
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -92,7 +91,7 @@ TYPE_MAP = {
 }
 
 
-# MARK: - PDF-парсинг (базовые функции)
+# MARK: - PDF-парсинг
 
 def find_group_col(table, group_filter):
     for row in table:
@@ -139,6 +138,11 @@ def find_first_group_col(table):
     return 2
 
 
+def normalize_teacher_name(name: str) -> str:
+    """Убирает переносы строк и лишние пробелы внутри имени преподавателя."""
+    return re.sub(r"\s+", " ", name).strip()
+
+
 def parse_lesson_cell(text: str):
     text = (text or "").strip()
     if not text or len(text) < 3:
@@ -160,8 +164,8 @@ def parse_lesson_cell(text: str):
         lesson_type = TYPE_MAP.get(type_raw, type_raw.upper())
         text = text[:last_match.start()] + text[last_match.end():]
 
-    teacher_match = re.search(r"[А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.\s?[А-ЯЁ]\.", text)
-    teacher = teacher_match.group(0).strip() if teacher_match else None
+    teacher_match = re.search(r"[А-ЯЁ][а-яё]+\s*\n?\s*[А-ЯЁ]\.\s?[А-ЯЁ]\.", text)
+    teacher = normalize_teacher_name(teacher_match.group(0)) if teacher_match else None
     if teacher_match:
         text = text[:teacher_match.start()] + text[teacher_match.end():]
 
@@ -176,7 +180,7 @@ def is_continuation_only(cell_text: str) -> bool:
     stripped = cell_text.strip()
     if not stripped:
         return False
-    teacher_pattern = r"[А-ЯЁ][а-яё]+\s+[А-ЯЁ]\.\s?[А-ЯЁ]\."
+    teacher_pattern = r"[А-ЯЁ][а-яё]+\s*\n?\s*[А-ЯЁ]\.\s?[А-ЯЁ]\."
     room_pattern = r"[Аа]уд\.?\s*[\d\.]+[а-яА-Яa-zA-Z]?"
     test = re.sub(teacher_pattern, "", stripped)
     test = re.sub(room_pattern, "", test)
@@ -184,8 +188,8 @@ def is_continuation_only(cell_text: str) -> bool:
     return len(test) < 3 and len(stripped) > 0
 
 
-def parse_pdf(pdf_url: str, group_filter: str = None):
-    table = get_pdf_table(pdf_url)
+def parse_pdf(pdf_url: str, group_filter: str = None, prefetched_table=None):
+    table = prefetched_table if prefetched_table is not None else get_pdf_table(pdf_url)
     if not table:
         return []
 
@@ -462,7 +466,6 @@ def is_schedule_page(html: str) -> bool:
 
 
 def parse_schedule_page_pdfs(html: str):
-    """Возвращает список (pdf_url, week_label) для страницы расписания."""
     soup = BeautifulSoup(html, "html.parser")
     results = []
     for item in soup.select("#_list_sched ._items_"):
@@ -476,17 +479,18 @@ def parse_schedule_page_pdfs(html: str):
     return results
 
 
-def index_faculty_teachers(faculty_tile_href: str, faculty_name: str, max_weeks_per_group: int = 3):
+def index_faculty_teachers(faculty_tile_href: str, faculty_name: str, max_weeks_per_group: int = 6):
     """
     Обходит все курсы одного факультета, для каждого — берёт несколько
-    ближайших недель, парсит ВСЕ группы в каждом PDF и собирает
-    список пар каждого преподавателя.
+    ближайших недель, парсит ВСЕ группы в каждом PDF (переиспользуя
+    уже проверенную parse_pdf с полным набором фиксов: определение дня,
+    rowspan-склейка, нормализация имени препода) и собирает список пар
+    каждого преподавателя.
     """
     full_url = faculty_tile_href if faculty_tile_href.startswith("http") else "https://www.vavt.ru" + faculty_tile_href
     html = fetch_html(full_url)
 
     if not is_schedule_page(html):
-        # Это ещё уровень курсов — заходим в каждый курс
         course_tiles = parse_tile_links(html)
         all_results = []
         for tile in course_tiles:
@@ -503,12 +507,6 @@ def index_faculty_teachers(faculty_tile_href: str, faculty_name: str, max_weeks_
             if not table:
                 continue
 
-            lessons = parse_pdf(pdf_url, group_filter=None)
-
-            # Также нужно знать К КАКОЙ группе относится каждая пара —
-            # parse_pdf без фильтра смешивает все колонки. Для индексации
-            # преподавателей нам нужна привязка к группе, поэтому парсим
-            # каждую группу отдельно.
             pattern = re.compile(r"^[А-ЯЁ]\d{2}[А-ЯЁ][–\-—][А-ЯЁ]{2,6}\.\d$")
             groups = []
             for row in table:
@@ -519,12 +517,13 @@ def index_faculty_teachers(faculty_tile_href: str, faculty_name: str, max_weeks_
                             groups.append(name)
 
             for group_name in groups:
-                group_lessons = parse_pdf(pdf_url, group_filter=group_name)
+                # Переиспользуем ту же таблицу — не скачиваем PDF заново на каждую группу
+                group_lessons = parse_pdf(pdf_url, group_filter=group_name, prefetched_table=table)
                 for lesson in group_lessons:
                     if lesson.get("teacher"):
                         results.append({
                             "faculty": faculty_name,
-                            "teacher_name": lesson["teacher"],
+                            "teacher_name": normalize_teacher_name(lesson["teacher"]),
                             "day": lesson.get("day"),
                             "time_start": lesson.get("timeStart"),
                             "time_end": lesson.get("timeEnd"),
@@ -541,18 +540,12 @@ def index_faculty_teachers(faculty_tile_href: str, faculty_name: str, max_weeks_
 
 @app.post("/index-faculty")
 def trigger_faculty_index(faculty_href: str, faculty_name: str):
-    """
-    Запускает полную индексацию преподавателей одного факультета.
-    faculty_href — href плитки факультета (например из /schedule/?f=...&o=...&n=ФВМ)
-    """
     try:
         results = index_faculty_teachers(faculty_href, faculty_name)
 
         db: Session = SessionLocal()
         try:
-            # Удаляем старый индекс этого факультета перед вставкой нового
             db.query(TeacherLesson).filter(TeacherLesson.faculty == faculty_name).delete()
-
             for r in results:
                 entry = TeacherLesson(**r)
                 db.add(entry)
