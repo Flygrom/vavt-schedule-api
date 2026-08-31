@@ -144,31 +144,36 @@ def normalize_teacher_name(name: str) -> str:
 
 def resolve_colspan_value(row, col_index: int, first_group_col: int):
     """
-    Возвращает "эффективное" значение ячейки в позиции col_index, учитывая
-    объединённые ячейки (colspan): если сама ячейка пустая, ищем ближайшую
-    непустую ячейку СЛЕВА в пределах диапазона групп — она может быть
-    объединённой ячейкой, растянутой на col_index.
+    pdfplumber кодирует ОБЪЕДИНЁННЫЕ (colspan) ячейки как None,
+    а ОБЫЧНЫЕ пустые ячейки (у этой группы просто нет пары)
+    как пустую строку ''.
 
-    ВАЖНО: если между найденной непустой ячейкой слева и col_index
-    есть ДРУГАЯ непустая ячейка — значит col_index не покрывается
-    той дальней ячейкой, и мы возвращаем None (пусто по-настоящему).
+    Поэтому: если прямое значение ячейки — None, ищем ближайшее
+    непустое значение СЛЕВА, но останавливаемся сразу как только
+    встречаем '' — это граница настоящей пустой ячейки, а не
+    часть объединения.
+
+    Если прямое значение — '', ячейка реально пуста (не растягиваем).
+    Если прямое значение — непустая строка, возвращаем её как есть.
     """
     if col_index >= len(row):
         return None
 
     direct_value = row[col_index]
+
+    if direct_value is None:
+        for i in range(col_index - 1, first_group_col - 1, -1):
+            if i >= len(row):
+                continue
+            candidate = row[i]
+            if candidate == "":
+                return None
+            if candidate and str(candidate).strip():
+                return str(candidate)
+        return None
+
     if direct_value and str(direct_value).strip():
         return str(direct_value)
-
-    # Ищем ближайшую непустую ячейку слева, в пределах групповых колонок
-    for i in range(col_index - 1, first_group_col - 1, -1):
-        if i >= len(row):
-            continue
-        candidate = row[i]
-        if candidate and str(candidate).strip():
-            return str(candidate)
-        # Если встретили ещё одну явно пустую ячейку — продолжаем искать левее
-        # (None и '' оба считаются "пустыми" в объединённой зоне)
 
     return None
 
@@ -204,18 +209,6 @@ def parse_lesson_cell(text: str):
         subject = original.strip()
 
     return {"subject": subject, "teacher": teacher, "room": room, "type": lesson_type}
-
-
-def is_continuation_only(cell_text: str) -> bool:
-    stripped = cell_text.strip()
-    if not stripped:
-        return False
-    teacher_pattern = r"[А-ЯЁ][а-яё]+\s*\n?\s*[А-ЯЁ]\.\s?[А-ЯЁ]\."
-    room_pattern = r"[Аа]уд\.?\s*[\d\.]+[а-яА-Яa-zA-Z]?"
-    test = re.sub(teacher_pattern, "", stripped)
-    test = re.sub(room_pattern, "", test)
-    test = test.strip(" \n.,;:-_")
-    return len(test) < 3 and len(stripped) > 0
 
 
 def parse_pdf(pdf_url: str, group_filter: str = None, prefetched_table=None):
