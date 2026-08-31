@@ -139,8 +139,38 @@ def find_first_group_col(table):
 
 
 def normalize_teacher_name(name: str) -> str:
-    """Убирает переносы строк и лишние пробелы внутри имени преподавателя."""
     return re.sub(r"\s+", " ", name).strip()
+
+
+def resolve_colspan_value(row, col_index: int, first_group_col: int):
+    """
+    Возвращает "эффективное" значение ячейки в позиции col_index, учитывая
+    объединённые ячейки (colspan): если сама ячейка пустая, ищем ближайшую
+    непустую ячейку СЛЕВА в пределах диапазона групп — она может быть
+    объединённой ячейкой, растянутой на col_index.
+
+    ВАЖНО: если между найденной непустой ячейкой слева и col_index
+    есть ДРУГАЯ непустая ячейка — значит col_index не покрывается
+    той дальней ячейкой, и мы возвращаем None (пусто по-настоящему).
+    """
+    if col_index >= len(row):
+        return None
+
+    direct_value = row[col_index]
+    if direct_value and str(direct_value).strip():
+        return str(direct_value)
+
+    # Ищем ближайшую непустую ячейку слева, в пределах групповых колонок
+    for i in range(col_index - 1, first_group_col - 1, -1):
+        if i >= len(row):
+            continue
+        candidate = row[i]
+        if candidate and str(candidate).strip():
+            return str(candidate)
+        # Если встретили ещё одну явно пустую ячейку — продолжаем искать левее
+        # (None и '' оба считаются "пустыми" в объединённой зоне)
+
+    return None
 
 
 def parse_lesson_cell(text: str):
@@ -233,26 +263,7 @@ def parse_pdf(pdf_url: str, group_filter: str = None, prefetched_table=None):
 
         effective_day = current_day or find_first_day_after(table, row_idx)
 
-        group_cells = [
-            (i, str(row[i]).strip())
-            for i in range(first_group_col, len(row))
-            if row[i] and str(row[i]).strip()
-        ]
-
-        def add_lesson(cell_text, col_index=None):
-            if col_index is not None and is_continuation_only(cell_text):
-                for prev in reversed(lessons):
-                    if prev.get("_col") == col_index and prev["day"] == effective_day:
-                        parsed_extra = parse_lesson_cell(cell_text)
-                        if parsed_extra:
-                            if parsed_extra.get("teacher") and not prev.get("teacher"):
-                                prev["teacher"] = parsed_extra["teacher"]
-                            if parsed_extra.get("room") and not prev.get("room"):
-                                prev["room"] = parsed_extra["room"]
-                            prev["timeEnd"] = current_time[1]
-                        return
-                return
-
+        def add_lesson(cell_text):
             parsed = parse_lesson_cell(cell_text)
             if not parsed:
                 return
@@ -264,24 +275,14 @@ def parse_pdf(pdf_url: str, group_filter: str = None, prefetched_table=None):
                 "day": effective_day,
                 "timeStart": current_time[0],
                 "timeEnd": current_time[1],
-                "_col": col_index,
                 **parsed
             })
 
-        if len(group_cells) == 1 and group_cells[0][0] == first_group_col:
-            add_lesson(group_cells[0][1], first_group_col)
-            continue
-
         for col in target_cols:
-            if col >= len(row):
+            cell_text = resolve_colspan_value(row, col, first_group_col)
+            if not cell_text:
                 continue
-            cell_text = row[col]
-            if not cell_text or not str(cell_text).strip():
-                continue
-            add_lesson(str(cell_text), col)
-
-    for lesson in lessons:
-        lesson.pop("_col", None)
+            add_lesson(cell_text)
 
     return lessons
 
@@ -480,13 +481,6 @@ def parse_schedule_page_pdfs(html: str):
 
 
 def index_faculty_teachers(faculty_tile_href: str, faculty_name: str, max_weeks_per_group: int = 6):
-    """
-    Обходит все курсы одного факультета, для каждого — берёт несколько
-    ближайших недель, парсит ВСЕ группы в каждом PDF (переиспользуя
-    уже проверенную parse_pdf с полным набором фиксов: определение дня,
-    rowspan-склейка, нормализация имени препода) и собирает список пар
-    каждого преподавателя.
-    """
     full_url = faculty_tile_href if faculty_tile_href.startswith("http") else "https://www.vavt.ru" + faculty_tile_href
     html = fetch_html(full_url)
 
@@ -517,7 +511,6 @@ def index_faculty_teachers(faculty_tile_href: str, faculty_name: str, max_weeks_
                             groups.append(name)
 
             for group_name in groups:
-                # Переиспользуем ту же таблицу — не скачиваем PDF заново на каждую группу
                 group_lessons = parse_pdf(pdf_url, group_filter=group_name, prefetched_table=table)
                 for lesson in group_lessons:
                     if lesson.get("teacher"):
@@ -588,6 +581,20 @@ def search_teachers(query: str, faculty: str = None):
         return {"ok": False, "error": str(e), "items": []}
     finally:
         db.close()
+
+
+@app.get("/debug-table")
+def debug_table(pdf_url: str):
+    try:
+        table = get_pdf_table(pdf_url)
+        if not table:
+            return {"ok": False, "error": "no table"}
+        rows = []
+        for i, row in enumerate(table):
+            rows.append({"row": i, "cells": [str(c)[:80] if c else None for c in row]})
+        return {"ok": True, "rows": rows}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 if __name__ == "__main__":
