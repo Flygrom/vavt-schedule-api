@@ -38,6 +38,7 @@ class Homework(Base):
     text = Column(String)
     is_shared = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+    is_hidden = Column(Boolean, default=False)
 
     files = relationship("HomeworkFile", back_populates="homework", cascade="all, delete-orphan")
 
@@ -68,6 +69,25 @@ class TeacherLesson(Base):
     group_name = Column(String)
     week_label = Column(String)
     indexed_at = Column(DateTime, default=datetime.utcnow)
+
+
+class HomeworkReport(Base):
+    __tablename__ = "homework_reports"
+
+    id = Column(Integer, primary_key=True, index=True)
+    homework_id = Column(Integer, ForeignKey("homework.id"))
+    reporter_name = Column(String)
+    reason = Column(String)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class BlockedUser(Base):
+    __tablename__ = "blocked_users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    blocker_name = Column(String, index=True)
+    blocked_name = Column(String, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 Base.metadata.create_all(bind=engine)
@@ -143,24 +163,9 @@ def normalize_teacher_name(name: str) -> str:
 
 
 def resolve_colspan_value(row, col_index: int, first_group_col: int):
-    """
-    pdfplumber кодирует ОБЪЕДИНЁННЫЕ (colspan) ячейки как None,
-    а ОБЫЧНЫЕ пустые ячейки (у этой группы просто нет пары)
-    как пустую строку ''.
-
-    Поэтому: если прямое значение ячейки — None, ищем ближайшее
-    непустое значение СЛЕВА, но останавливаемся сразу как только
-    встречаем '' — это граница настоящей пустой ячейки, а не
-    часть объединения.
-
-    Если прямое значение — '', ячейка реально пуста (не растягиваем).
-    Если прямое значение — непустая строка, возвращаем её как есть.
-    """
     if col_index >= len(row):
         return None
-
     direct_value = row[col_index]
-
     if direct_value is None:
         for i in range(col_index - 1, first_group_col - 1, -1):
             if i >= len(row):
@@ -171,10 +176,8 @@ def resolve_colspan_value(row, col_index: int, first_group_col: int):
             if candidate and str(candidate).strip():
                 return str(candidate)
         return None
-
     if direct_value and str(direct_value).strip():
         return str(direct_value)
-
     return None
 
 
@@ -364,13 +367,28 @@ def create_homework(hw: HomeworkCreate):
 def list_homework(group_name: str, author_name: str = None):
     db: Session = SessionLocal()
     try:
-        query = db.query(Homework).filter(Homework.group_name == group_name)
+        # Список тех, кого текущий пользователь заблокировал
+        blocked_names = []
+        if author_name:
+            blocked_rows = db.query(BlockedUser).filter(BlockedUser.blocker_name == author_name).all()
+            blocked_names = [b.blocked_name for b in blocked_rows]
+
+        query = db.query(Homework).filter(
+            Homework.group_name == group_name,
+            Homework.is_hidden == False
+        )
+
         if author_name:
             entries = query.filter(
                 (Homework.is_shared == True) | (Homework.author_name == author_name)
             ).order_by(Homework.created_at.desc()).all()
         else:
             entries = query.filter(Homework.is_shared == True).order_by(Homework.created_at.desc()).all()
+
+        # Отфильтровываем ДЗ от заблокированных авторов
+        if blocked_names:
+            entries = [e for e in entries if e.author_name not in blocked_names]
+
         return {"ok": True, "items": [homework_to_dict(e) for e in entries]}
     except Exception as e:
         return {"ok": False, "error": str(e), "items": []}
@@ -430,6 +448,113 @@ async def upload_homework_file(homework_id: int, file: UploadFile = File(...)):
         }
     except Exception as e:
         return {"ok": False, "error": str(e)}
+    finally:
+        db.close()
+
+
+# MARK: - Жалобы на ДЗ
+
+class ReportCreate(BaseModel):
+    homework_id: int
+    reporter_name: str
+    reason: str
+
+
+AUTO_HIDE_THRESHOLD = 3  # после скольких уникальных жалоб ДЗ скрывается автоматически
+
+
+@app.post("/homework/report")
+def report_homework(report: ReportCreate):
+    db: Session = SessionLocal()
+    try:
+        entry = db.query(Homework).filter(Homework.id == report.homework_id).first()
+        if not entry:
+            return {"ok": False, "error": "Домашнее задание не найдено"}
+
+        # Не даём одному человеку пожаловаться на одно и то же ДЗ дважды
+        existing = db.query(HomeworkReport).filter(
+            HomeworkReport.homework_id == report.homework_id,
+            HomeworkReport.reporter_name == report.reporter_name
+        ).first()
+        if existing:
+            return {"ok": True, "already_reported": True}
+
+        new_report = HomeworkReport(
+            homework_id=report.homework_id,
+            reporter_name=report.reporter_name,
+            reason=report.reason,
+        )
+        db.add(new_report)
+
+        report_count = db.query(HomeworkReport).filter(
+            HomeworkReport.homework_id == report.homework_id
+        ).count() + 1
+
+        if report_count >= AUTO_HIDE_THRESHOLD:
+            entry.is_hidden = True
+
+        db.commit()
+        return {"ok": True, "hidden": entry.is_hidden}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    finally:
+        db.close()
+
+
+# MARK: - Блокировка пользователей
+
+class BlockUserRequest(BaseModel):
+    blocker_name: str
+    blocked_name: str
+
+
+@app.post("/users/block")
+def block_user(req: BlockUserRequest):
+    db: Session = SessionLocal()
+    try:
+        existing = db.query(BlockedUser).filter(
+            BlockedUser.blocker_name == req.blocker_name,
+            BlockedUser.blocked_name == req.blocked_name
+        ).first()
+        if existing:
+            return {"ok": True, "already_blocked": True}
+
+        entry = BlockedUser(blocker_name=req.blocker_name, blocked_name=req.blocked_name)
+        db.add(entry)
+        db.commit()
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    finally:
+        db.close()
+
+
+@app.post("/users/unblock")
+def unblock_user(req: BlockUserRequest):
+    db: Session = SessionLocal()
+    try:
+        entry = db.query(BlockedUser).filter(
+            BlockedUser.blocker_name == req.blocker_name,
+            BlockedUser.blocked_name == req.blocked_name
+        ).first()
+        if entry:
+            db.delete(entry)
+            db.commit()
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    finally:
+        db.close()
+
+
+@app.get("/users/blocked")
+def get_blocked_users(blocker_name: str):
+    db: Session = SessionLocal()
+    try:
+        rows = db.query(BlockedUser).filter(BlockedUser.blocker_name == blocker_name).all()
+        return {"ok": True, "blocked": [r.blocked_name for r in rows]}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "blocked": []}
     finally:
         db.close()
 
