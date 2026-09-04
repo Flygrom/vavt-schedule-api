@@ -1,4 +1,5 @@
 import io
+import os
 import re
 import requests
 import pdfplumber
@@ -9,15 +10,17 @@ from datetime import datetime
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, ForeignKey
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, ForeignKey, inspect, text, or_
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
 
 # MARK: - Cloudinary
+# Секреты берутся из переменных окружения Railway (Settings -> Variables),
+# никогда не хардкодим их в коде.
 
 cloudinary.config(
-    cloud_name="bfolh7o5",
-    api_key="519197542141111",
-    api_secret="-C76Y2uFwF4xkI5E0282rkuAjOg"
+    cloud_name=os.environ["CLOUDINARY_CLOUD_NAME"],
+    api_key=os.environ["CLOUDINARY_API_KEY"],
+    api_secret=os.environ["CLOUDINARY_API_SECRET"],
 )
 
 # MARK: - База данных
@@ -39,6 +42,7 @@ class Homework(Base):
     is_shared = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     is_hidden = Column(Boolean, default=False)
+    owner_token = Column(String, index=True, nullable=True)
 
     files = relationship("HomeworkFile", back_populates="homework", cascade="all, delete-orphan")
 
@@ -78,6 +82,7 @@ class HomeworkReport(Base):
     homework_id = Column(Integer, ForeignKey("homework.id"))
     reporter_name = Column(String)
     reason = Column(String)
+    device_token = Column(String, index=True, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -85,12 +90,27 @@ class BlockedUser(Base):
     __tablename__ = "blocked_users"
 
     id = Column(Integer, primary_key=True, index=True)
-    blocker_name = Column(String, index=True)
+    blocker_name = Column(String, index=True, nullable=True)
     blocked_name = Column(String, index=True)
+    device_token = Column(String, index=True, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
 Base.metadata.create_all(bind=engine)
+
+
+def _ensure_column(table: str, column: str, coltype: str):
+    """SQLite не добавляет новые колонки через create_all — доращиваем схему вручную."""
+    inspector = inspect(engine)
+    existing = [c["name"] for c in inspector.get_columns(table)]
+    if column not in existing:
+        with engine.begin() as conn:
+            conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}"))
+
+
+_ensure_column("homework", "owner_token", "VARCHAR")
+_ensure_column("homework_reports", "device_token", "VARCHAR")
+_ensure_column("blocked_users", "device_token", "VARCHAR")
 
 app = FastAPI()
 
@@ -324,6 +344,7 @@ class HomeworkCreate(BaseModel):
     author_name: str
     text: str
     is_shared: bool = True
+    device_token: str
 
 
 def homework_to_dict(entry: Homework):
@@ -352,6 +373,7 @@ def create_homework(hw: HomeworkCreate):
             author_name=hw.author_name,
             text=hw.text,
             is_shared=hw.is_shared,
+            owner_token=hw.device_token,
         )
         db.add(entry)
         db.commit()
@@ -364,13 +386,14 @@ def create_homework(hw: HomeworkCreate):
 
 
 @app.get("/homework")
-def list_homework(group_name: str, author_name: str = None):
+def list_homework(group_name: str, author_name: str = None, device_token: str = None):
     db: Session = SessionLocal()
     try:
-        # Список тех, кого текущий пользователь заблокировал
+        # Список тех, кого текущий пользователь заблокировал (по device_token,
+        # т.к. author_name — это произвольное имя и им нельзя удостоверять личность)
         blocked_names = []
-        if author_name:
-            blocked_rows = db.query(BlockedUser).filter(BlockedUser.blocker_name == author_name).all()
+        if device_token:
+            blocked_rows = db.query(BlockedUser).filter(BlockedUser.device_token == device_token).all()
             blocked_names = [b.blocked_name for b in blocked_rows]
 
         query = db.query(Homework).filter(
@@ -378,12 +401,13 @@ def list_homework(group_name: str, author_name: str = None):
             Homework.is_hidden == False
         )
 
+        conditions = [Homework.is_shared == True]
+        if device_token:
+            conditions.append(Homework.owner_token == device_token)
         if author_name:
-            entries = query.filter(
-                (Homework.is_shared == True) | (Homework.author_name == author_name)
-            ).order_by(Homework.created_at.desc()).all()
-        else:
-            entries = query.filter(Homework.is_shared == True).order_by(Homework.created_at.desc()).all()
+            conditions.append(Homework.author_name == author_name)
+
+        entries = query.filter(or_(*conditions)).order_by(Homework.created_at.desc()).all()
 
         # Отфильтровываем ДЗ от заблокированных авторов
         if blocked_names:
@@ -397,13 +421,15 @@ def list_homework(group_name: str, author_name: str = None):
 
 
 @app.delete("/homework/{homework_id}")
-def delete_homework(homework_id: int, author_name: str):
+def delete_homework(homework_id: int, device_token: str):
     db: Session = SessionLocal()
     try:
         entry = db.query(Homework).filter(Homework.id == homework_id).first()
         if not entry:
             return {"ok": False, "error": "Не найдено"}
-        if entry.author_name != author_name:
+        # owner_token — это непередаваемый секрет с устройства автора, в отличие
+        # от author_name (который виден всем и раньше был единственной "проверкой").
+        if not entry.owner_token or entry.owner_token != device_token:
             return {"ok": False, "error": "Можно удалять только своё ДЗ"}
         db.delete(entry)
         db.commit()
@@ -458,6 +484,7 @@ class ReportCreate(BaseModel):
     homework_id: int
     reporter_name: str
     reason: str
+    device_token: str
 
 
 AUTO_HIDE_THRESHOLD = 3  # после скольких уникальных жалоб ДЗ скрывается автоматически
@@ -471,10 +498,11 @@ def report_homework(report: ReportCreate):
         if not entry:
             return {"ok": False, "error": "Домашнее задание не найдено"}
 
-        # Не даём одному человеку пожаловаться на одно и то же ДЗ дважды
+        # Не даём одному устройству пожаловаться на одно и то же ДЗ дважды
+        # (по device_token, а не по вводимому вручную имени, которое легко сменить)
         existing = db.query(HomeworkReport).filter(
             HomeworkReport.homework_id == report.homework_id,
-            HomeworkReport.reporter_name == report.reporter_name
+            HomeworkReport.device_token == report.device_token
         ).first()
         if existing:
             return {"ok": True, "already_reported": True}
@@ -483,6 +511,7 @@ def report_homework(report: ReportCreate):
             homework_id=report.homework_id,
             reporter_name=report.reporter_name,
             reason=report.reason,
+            device_token=report.device_token,
         )
         db.add(new_report)
 
@@ -504,8 +533,8 @@ def report_homework(report: ReportCreate):
 # MARK: - Блокировка пользователей
 
 class BlockUserRequest(BaseModel):
-    blocker_name: str
     blocked_name: str
+    device_token: str
 
 
 @app.post("/users/block")
@@ -513,13 +542,13 @@ def block_user(req: BlockUserRequest):
     db: Session = SessionLocal()
     try:
         existing = db.query(BlockedUser).filter(
-            BlockedUser.blocker_name == req.blocker_name,
+            BlockedUser.device_token == req.device_token,
             BlockedUser.blocked_name == req.blocked_name
         ).first()
         if existing:
             return {"ok": True, "already_blocked": True}
 
-        entry = BlockedUser(blocker_name=req.blocker_name, blocked_name=req.blocked_name)
+        entry = BlockedUser(device_token=req.device_token, blocked_name=req.blocked_name)
         db.add(entry)
         db.commit()
         return {"ok": True}
@@ -534,7 +563,7 @@ def unblock_user(req: BlockUserRequest):
     db: Session = SessionLocal()
     try:
         entry = db.query(BlockedUser).filter(
-            BlockedUser.blocker_name == req.blocker_name,
+            BlockedUser.device_token == req.device_token,
             BlockedUser.blocked_name == req.blocked_name
         ).first()
         if entry:
@@ -548,10 +577,10 @@ def unblock_user(req: BlockUserRequest):
 
 
 @app.get("/users/blocked")
-def get_blocked_users(blocker_name: str):
+def get_blocked_users(device_token: str):
     db: Session = SessionLocal()
     try:
-        rows = db.query(BlockedUser).filter(BlockedUser.blocker_name == blocker_name).all()
+        rows = db.query(BlockedUser).filter(BlockedUser.device_token == device_token).all()
         return {"ok": True, "blocked": [r.blocked_name for r in rows]}
     except Exception as e:
         return {"ok": False, "error": str(e), "blocked": []}
