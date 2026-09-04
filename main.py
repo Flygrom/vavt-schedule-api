@@ -23,6 +23,32 @@ cloudinary.config(
     api_secret=os.environ["CLOUDINARY_API_SECRET"],
 )
 
+# MARK: - DeepL (перевод названий предметов на английский)
+# Опционально: если ключ не задан, английский режим просто отдаёт русский текст как есть.
+
+DEEPL_API_KEY = os.environ.get("DEEPL_API_KEY")
+DEEPL_URL = (
+    "https://api-free.deepl.com/v2/translate"
+    if DEEPL_API_KEY and DEEPL_API_KEY.endswith(":fx")
+    else "https://api.deepl.com/v2/translate"
+)
+
+
+def translate_texts(texts: list, target_lang: str = "EN-US") -> list:
+    if not DEEPL_API_KEY or not texts:
+        return texts
+    try:
+        resp = requests.post(
+            DEEPL_URL,
+            headers={"Authorization": f"DeepL-Auth-Key {DEEPL_API_KEY}"},
+            data={"text": texts, "target_lang": target_lang, "source_lang": "RU"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return [t["text"] for t in resp.json()["translations"]]
+    except Exception:
+        return texts
+
 # MARK: - База данных
 
 DATABASE_URL = "sqlite:///./homework.db"
@@ -93,6 +119,17 @@ class Lesson(Base):
     room = Column(String, nullable=True)
     lesson_type = Column(String, nullable=True)
     indexed_at = Column(DateTime, default=datetime.utcnow)
+
+
+class SubjectTranslation(Base):
+    """Кэш переводов названий предметов — переводим каждое название один раз,
+    а не при каждом запросе (DeepL просят так же дедуплицировать самостоятельно)."""
+    __tablename__ = "subject_translations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    subject_ru = Column(String, unique=True, index=True)
+    subject_en = Column(String)
+    updated_at = Column(DateTime, default=datetime.utcnow)
 
 
 class HomeworkReport(Base):
@@ -323,6 +360,27 @@ def parse_pdf(pdf_url: str, group_filter: str = None, prefetched_table=None):
     return lessons
 
 
+def get_translated_subjects(db: Session, subjects_ru: list) -> dict:
+    """Переводит уникальные названия предметов, кэшируя результат в БД —
+    один и тот же предмет переводится через DeepL только один раз за всё время."""
+    unique = list(dict.fromkeys(s for s in subjects_ru if s))
+    if not unique:
+        return {}
+
+    existing = db.query(SubjectTranslation).filter(SubjectTranslation.subject_ru.in_(unique)).all()
+    result = {e.subject_ru: e.subject_en for e in existing}
+
+    missing = [s for s in unique if s not in result]
+    if missing:
+        translated = translate_texts(missing)
+        for ru, en in zip(missing, translated):
+            db.add(SubjectTranslation(subject_ru=ru, subject_en=en))
+            result[ru] = en
+        db.commit()
+
+    return result
+
+
 @app.get("/")
 def root():
     return {"status": "ok", "service": "ВАВТ Расписание API"}
@@ -338,10 +396,11 @@ def get_schedule(pdf_url: str, group: str = None):
 
 
 @app.get("/schedule-db")
-def get_schedule_db(pdf_url: str, group: str = None):
+def get_schedule_db(pdf_url: str, group: str = None, lang: str = "ru"):
     """Тот же формат ответа, что /schedule, но сначала читает уже проиндексированные
     пары из базы — и только если для этого pdf_url+группы вообще ничего нет,
-    парсит PDF один раз и сохраняет результат на будущее (для всех пользователей)."""
+    парсит PDF один раз и сохраняет результат на будущее (для всех пользователей).
+    lang=en — подставляет переведённые названия предметов (см. get_translated_subjects)."""
     db: Session = SessionLocal()
     try:
         query = db.query(Lesson).filter(Lesson.pdf_url == pdf_url)
@@ -359,23 +418,29 @@ def get_schedule_db(pdf_url: str, group: str = None):
                 "room": e.room,
                 "type": e.lesson_type,
             } for e in entries]
-            return {"ok": True, "group": group, "count": len(lessons), "lessons": lessons}
+        else:
+            # Ничего не найдено — это первый запрос по этой неделе/группе, парсим и кешируем
+            lessons = parse_pdf(pdf_url, group)
+            for lesson in lessons:
+                db.add(Lesson(
+                    pdf_url=pdf_url,
+                    group_name=group,
+                    day=lesson.get("day"),
+                    time_start=lesson.get("timeStart"),
+                    time_end=lesson.get("timeEnd"),
+                    subject=lesson.get("subject"),
+                    teacher=lesson.get("teacher"),
+                    room=lesson.get("room"),
+                    lesson_type=lesson.get("type"),
+                ))
+            db.commit()
 
-        # Ничего не найдено — это первый запрос по этой неделе/группе, парсим и кешируем
-        lessons = parse_pdf(pdf_url, group)
-        for lesson in lessons:
-            db.add(Lesson(
-                pdf_url=pdf_url,
-                group_name=group,
-                day=lesson.get("day"),
-                time_start=lesson.get("timeStart"),
-                time_end=lesson.get("timeEnd"),
-                subject=lesson.get("subject"),
-                teacher=lesson.get("teacher"),
-                room=lesson.get("room"),
-                lesson_type=lesson.get("type"),
-            ))
-        db.commit()
+        if lang == "en":
+            translations = get_translated_subjects(db, [l.get("subject") for l in lessons])
+            for l in lessons:
+                if l.get("subject") in translations:
+                    l["subject"] = translations[l["subject"]]
+
         return {"ok": True, "group": group, "count": len(lessons), "lessons": lessons}
     except Exception as e:
         return {"ok": False, "error": str(e), "lessons": []}
