@@ -75,6 +75,26 @@ class TeacherLesson(Base):
     indexed_at = Column(DateTime, default=datetime.utcnow)
 
 
+class Lesson(Base):
+    """Проиндексированные пары по каждой группе — заполняется /index-all и лениво
+    при первом запросе /schedule-db, чтобы приложение не парсило PDF на каждый чих."""
+    __tablename__ = "lessons"
+
+    id = Column(Integer, primary_key=True, index=True)
+    pdf_url = Column(String, index=True)
+    group_name = Column(String, index=True)
+    faculty = Column(String, nullable=True)
+    week_label = Column(String, nullable=True)
+    day = Column(String)
+    time_start = Column(String)
+    time_end = Column(String)
+    subject = Column(String)
+    teacher = Column(String, nullable=True)
+    room = Column(String, nullable=True)
+    lesson_type = Column(String, nullable=True)
+    indexed_at = Column(DateTime, default=datetime.utcnow)
+
+
 class HomeworkReport(Base):
     __tablename__ = "homework_reports"
 
@@ -315,6 +335,52 @@ def get_schedule(pdf_url: str, group: str = None):
         return {"ok": True, "group": group, "count": len(lessons), "lessons": lessons}
     except Exception as e:
         return {"ok": False, "error": str(e), "lessons": []}
+
+
+@app.get("/schedule-db")
+def get_schedule_db(pdf_url: str, group: str = None):
+    """Тот же формат ответа, что /schedule, но сначала читает уже проиндексированные
+    пары из базы — и только если для этого pdf_url+группы вообще ничего нет,
+    парсит PDF один раз и сохраняет результат на будущее (для всех пользователей)."""
+    db: Session = SessionLocal()
+    try:
+        query = db.query(Lesson).filter(Lesson.pdf_url == pdf_url)
+        if group:
+            query = query.filter(Lesson.group_name == group)
+        entries = query.all()
+
+        if entries:
+            lessons = [{
+                "day": e.day,
+                "timeStart": e.time_start,
+                "timeEnd": e.time_end,
+                "subject": e.subject,
+                "teacher": e.teacher,
+                "room": e.room,
+                "type": e.lesson_type,
+            } for e in entries]
+            return {"ok": True, "group": group, "count": len(lessons), "lessons": lessons}
+
+        # Ничего не найдено — это первый запрос по этой неделе/группе, парсим и кешируем
+        lessons = parse_pdf(pdf_url, group)
+        for lesson in lessons:
+            db.add(Lesson(
+                pdf_url=pdf_url,
+                group_name=group,
+                day=lesson.get("day"),
+                time_start=lesson.get("timeStart"),
+                time_end=lesson.get("timeEnd"),
+                subject=lesson.get("subject"),
+                teacher=lesson.get("teacher"),
+                room=lesson.get("room"),
+                lesson_type=lesson.get("type"),
+            ))
+        db.commit()
+        return {"ok": True, "group": group, "count": len(lessons), "lessons": lessons}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "lessons": []}
+    finally:
+        db.close()
 
 
 @app.get("/groups")
@@ -657,21 +723,44 @@ def index_faculty_teachers(faculty_tile_href: str, faculty_name: str, max_weeks_
                         if name not in groups:
                             groups.append(name)
 
-            for group_name in groups:
-                group_lessons = parse_pdf(pdf_url, group_filter=group_name, prefetched_table=table)
-                for lesson in group_lessons:
-                    if lesson.get("teacher"):
-                        results.append({
-                            "faculty": faculty_name,
-                            "teacher_name": normalize_teacher_name(lesson["teacher"]),
-                            "day": lesson.get("day"),
-                            "time_start": lesson.get("timeStart"),
-                            "time_end": lesson.get("timeEnd"),
-                            "subject": lesson.get("subject"),
-                            "room": lesson.get("room"),
-                            "group_name": group_name,
-                            "week_label": week_label,
-                        })
+            db: Session = SessionLocal()
+            try:
+                # Один pdf_url = одна неделя одного профиля — чистим только его,
+                # чтобы не задеть данные других групп/недель при повторном прогоне.
+                db.query(Lesson).filter(Lesson.pdf_url == pdf_url).delete()
+
+                for group_name in groups:
+                    group_lessons = parse_pdf(pdf_url, group_filter=group_name, prefetched_table=table)
+                    for lesson in group_lessons:
+                        db.add(Lesson(
+                            pdf_url=pdf_url,
+                            group_name=group_name,
+                            faculty=faculty_name,
+                            week_label=week_label,
+                            day=lesson.get("day"),
+                            time_start=lesson.get("timeStart"),
+                            time_end=lesson.get("timeEnd"),
+                            subject=lesson.get("subject"),
+                            teacher=lesson.get("teacher"),
+                            room=lesson.get("room"),
+                            lesson_type=lesson.get("type"),
+                        ))
+                        if lesson.get("teacher"):
+                            results.append({
+                                "faculty": faculty_name,
+                                "teacher_name": normalize_teacher_name(lesson["teacher"]),
+                                "day": lesson.get("day"),
+                                "time_start": lesson.get("timeStart"),
+                                "time_end": lesson.get("timeEnd"),
+                                "subject": lesson.get("subject"),
+                                "room": lesson.get("room"),
+                                "group_name": group_name,
+                                "week_label": week_label,
+                            })
+
+                db.commit()
+            finally:
+                db.close()
         except Exception:
             continue
 
