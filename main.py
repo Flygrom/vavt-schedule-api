@@ -678,6 +678,41 @@ def index_faculty_teachers(faculty_tile_href: str, faculty_name: str, max_weeks_
     return results
 
 
+ROOT_SCHEDULE_URL = "https://www.vavt.ru/schedule/"
+
+
+@app.post("/index-all")
+def trigger_full_index(max_weeks_per_group: int = 6):
+    """Индексирует преподавателей ВСЕХ факультетов, а не одного вручную указанного."""
+    try:
+        html = fetch_html(ROOT_SCHEDULE_URL)
+        faculties = parse_tile_links(html)
+
+        total = 0
+        summary = []
+        for faculty in faculties:
+            try:
+                results = index_faculty_teachers(faculty["href"], faculty["title"], max_weeks_per_group)
+
+                db: Session = SessionLocal()
+                try:
+                    db.query(TeacherLesson).filter(TeacherLesson.faculty == faculty["title"]).delete()
+                    for r in results:
+                        db.add(TeacherLesson(**r))
+                    db.commit()
+                finally:
+                    db.close()
+
+                total += len(results)
+                summary.append({"faculty": faculty["title"], "indexed_count": len(results)})
+            except Exception as e:
+                summary.append({"faculty": faculty.get("title"), "error": str(e)})
+
+        return {"ok": True, "total_indexed": total, "faculties": summary}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.post("/index-faculty")
 def trigger_faculty_index(faculty_href: str, faculty_name: str):
     try:
