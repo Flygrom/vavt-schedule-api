@@ -51,7 +51,11 @@ def translate_texts(texts: list, target_lang: str = "EN-US") -> list:
 
 # MARK: - База данных
 
-DATABASE_URL = "sqlite:///./homework.db"
+# На Railway контейнер пересоздаётся при каждом деплое — если файл базы лежит
+# просто в рабочей директории, вся база стирается при каждом git push. Нужен
+# постоянный том (Volume), примонтированный в /data, и DATABASE_URL,
+# указывающий внутрь него (см. README/инструкцию по деплою).
+DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./homework.db")
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
