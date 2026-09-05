@@ -198,6 +198,19 @@ def find_group_col(table, group_filter):
     return None
 
 
+CID_PATTERN = re.compile(r"\(cid:\d+\)")
+
+
+def clean_pdf_text(value):
+    """pdfplumber иногда не может сопоставить глиф шрифта с юникодом и
+    возвращает сырое обозначение вида '(cid:10)' — вырезаем такой мусор."""
+    if value is None:
+        return value
+    cleaned = CID_PATTERN.sub("", str(value))
+    cleaned = re.sub(r"[ \t]+", " ", cleaned).strip()
+    return cleaned if cleaned else None
+
+
 def get_pdf_table(pdf_url: str):
     r = requests.get(pdf_url, headers=HEADERS, timeout=15)
     r.raise_for_status()
@@ -205,7 +218,7 @@ def get_pdf_table(pdf_url: str):
         for page in pdf.pages:
             tables = page.extract_tables()
             if tables:
-                return tables[0]
+                return [[clean_pdf_text(cell) for cell in row] for row in tables[0]]
     return None
 
 
@@ -769,8 +782,20 @@ def index_faculty_teachers(faculty_tile_href: str, faculty_name: str, max_weeks_
             all_results += index_faculty_teachers(tile["href"], faculty_name, max_weeks_per_group)
         return all_results
 
-    pdf_list = parse_schedule_page_pdfs(html)
-    pdf_list = pdf_list[:max_weeks_per_group]
+    # ВАЖНО: на одной странице курса может быть несколько профилей (несколько
+    # PDF на каждую неделю). Раньше здесь резалось "первые N ссылок подряд",
+    # из-за чего при 3+ профилях на неделю часть профилей/групп вообще не
+    # попадала в индекс. Теперь берём первые N уникальных недель целиком,
+    # со всеми профилями внутри них.
+    all_pdfs = parse_schedule_page_pdfs(html)
+    seen_weeks = []
+    pdf_list = []
+    for pdf_url, week_label in all_pdfs:
+        if week_label not in seen_weeks:
+            if len(seen_weeks) >= max_weeks_per_group:
+                break
+            seen_weeks.append(week_label)
+        pdf_list.append((pdf_url, week_label))
 
     results = []
     for pdf_url, week_label in pdf_list:
@@ -833,6 +858,19 @@ def index_faculty_teachers(faculty_tile_href: str, faculty_name: str, max_weeks_
 
 
 ROOT_SCHEDULE_URL = "https://www.vavt.ru/schedule/"
+
+
+@app.post("/purge-lessons")
+def purge_lessons():
+    """Служебная ручка: чистит кэш пар (Lesson), например после фикса парсинга,
+    чтобы старые "грязные" записи не продолжали отдаваться из базы."""
+    db: Session = SessionLocal()
+    try:
+        deleted = db.query(Lesson).delete()
+        db.commit()
+        return {"ok": True, "deleted": deleted}
+    finally:
+        db.close()
 
 
 @app.post("/index-all")
